@@ -1,0 +1,203 @@
+#! /usr/bin/env python3
+
+import base64
+from pathlib import Path
+import math
+import matplotlib.cm
+import numpy
+from nutils import mesh, solver
+from nutils.expression_v2 import Namespace
+import struct
+import treelog
+import zlib
+
+def main(output: Path):
+    cmap = 'plasma'
+    logo_scale = 14
+
+    bg_stroke_width = 4
+    bg_nelems = 64
+    bg = potential(nelems=bg_nelems, stroke_width=bg_stroke_width)
+    bg_max = numpy.max(bg)
+    bg_min = numpy.min(bg)
+    bg = numpy.clip(numpy.round((bg - bg_min) * (255 / (bg_max - bg_min))), 0, 255).astype(numpy.uint8)
+    bg = base64.b64encode(array_to_png(bg.T[::-1,:])).decode('ascii')
+
+    assert bg_nelems * logo_scale * 3 % 2 * bg_stroke_width == 0
+    bg_halfsize = bg_nelems * logo_scale * 3 // (2 * bg_stroke_width)
+    bg_size = 2 * bg_halfsize
+
+    cmap_colors = getattr(matplotlib.cm, cmap).colors
+
+    with open(output, 'w') as f:
+        f.write(svg_template.format(
+            size=f'{bg_size / 300}in',
+            cmap=cmap,
+            cmap_r=' '.join(f'{r:.6f}' for r, g, b in cmap_colors),
+            cmap_g=' '.join(f'{g:.6f}' for r, g, b in cmap_colors),
+            cmap_b=' '.join(f'{b:.6f}' for r, g, b in cmap_colors),
+            bg=bg,
+            bg_size=bg_size,
+            bg_halfsize=bg_halfsize,
+            logo_scale=logo_scale,
+        ))
+
+svg_template= '''\
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
+<svg version="1.1"
+     width="{size}"
+     height="{size}"
+     viewBox="-{bg_halfsize} -{bg_halfsize} {bg_size} {bg_size}"
+     xmlns="http://www.w3.org/2000/svg"
+     xmlns:xlink="http://www.w3.org/1999/xlink">
+    <defs>
+        <filter id="plasma" color-interpolation-filters="sRGB">
+            <feComponentTransfer>
+                <!-- colormap {cmap} from matplotlib -->
+                <feFuncR type="table" tableValues="{cmap_r}"/>
+                <feFuncG type="table" tableValues="{cmap_g}"/>
+                <feFuncB type="table" tableValues="{cmap_b}"/>
+            </feComponentTransfer>
+        </filter>
+    </defs>
+    <image xlink:href="data:image/png;base64,{bg}"
+           width="{bg_size}"
+           height="{bg_size}"
+           x="-{bg_halfsize}"
+           y="-{bg_halfsize}"
+           filter="url(#{cmap})"
+           image-rendering="optimizeQuality"/>
+    <path transform="scale({logo_scale})"
+          d="M -9 3 v -6 a 6 6 0 0 1 12 0 v 6 M 9 -3 v 6 a 6 6 0 0 1 -12 0 v -6"
+          fill="none"
+          stroke="white"
+          stroke-width="3"
+          stroke-linecap="round"/>
+</svg>
+'''
+
+def potential(stroke_width: int = 4, # The stroke width of the n and u in terms of number of elements.
+              nelems: int = 60,
+              degree: int = 3):
+
+    if (stroke_width % 2) != (nelems % 2):
+        treelog.warning('straight segments of the logo are not aligned with the mesh')
+
+    domain, geom = mesh.rectilinear([nelems]*2)
+
+    ns = Namespace()
+    ns.x = (geom - nelems/2) / stroke_width
+    ns.define_for('x', gradient='∇', jacobians=('dV', 'dS'), normal='n')
+
+    # Potential `u` and test function `v`.
+    ns.add_field(('u', 'v'), domain.basis('spline', degree=degree))
+
+    # The potential at the wall is chosen such that the potential will be a
+    # linear gradient with an angle of 30 degrees in absense of the logo.
+    ns.uwall = '(x_0 + sqrt(3) x_1) / 2'
+    ns.u = 'u + uwall'
+    sqr = domain.boundary.integral('(u - uwall)^2 dS' @ ns, degree=degree)
+    cons = solver.optimize('u,', sqr, droptol=1e-14)
+
+    # Trim the logo out of the domain.
+    def n_dist(x, y):
+        x = abs(x + 1)
+        y = y + 1
+        return numpy.choose(
+            numpy.searchsorted(numpy.array([0, 2]), y),
+            [
+                numpy.sqrt((x-2)**2+y**2),
+                abs(x-2),
+                abs(numpy.sqrt(x**2+(y-2)**2)-2),
+            ],
+        ) - 1/2
+
+    def nu_dist(x, y):
+        return numpy.minimum(n_dist(x, y), n_dist(-x, -y))
+
+    trimmed = domain.trim(nu_dist(*ns.x), maxrefine=4, name='nu')
+
+    # We're solving a potential problem on the trimmed domain subject to the
+    # Dirichlet boundary condition `u = uwall` and natural boundary at the
+    # trimmed boundary, the logo.
+    res = trimmed.integral('-∇_i(v) ∇_i(u) dV' @ ns, degree=degree)
+
+    # Note that we've defined a basis for the potential on the untrimmed
+    # `domain`. This causes dofs that have no or very little support on
+    # `trimmed` to be undetermined by `res`. For those dofs we're solving a
+    # Laplace problem, using the other dofs as Dirichlet constraints.
+    #
+    # Normally we would solve the problem on the trimmed domain first for the
+    # dofs that have support on that domain  and proceed with another solve on
+    # the complement domain for the remainder of the dofs. This, however, gives
+    # unwanted artifacts inside the logo. Dofs that have almost no support on
+    # the trimmed domain have a very small contribution to the residual and the
+    # solver might assign large values to those dofs.
+    #
+    # Instead, we simply add a Laplace problem on `domain-trimmed` to `res`
+    # with a much smaller weight than the Laplace problem defined above. This
+    # affects all dofs that have support on `domain-trimmed`, including the
+    # dofs that are well defined by `res`, but due to the scaling this effect
+    # is negligible.
+    res += (domain-trimmed).integral('-1e-5 ∇_i(v) ∇_i(u) dV' @ ns, degree=degree)
+
+    args = solver.solve_linear('u:v', res, constrain=cons)
+
+    smpl = domain.sample('gauss', 0)
+    return smpl.eval(ns.u, **args).reshape(nelems, nelems)
+
+def array_to_png(data, height = None, width = None):
+    # Copyright (C) 2014 Guido Draheim
+    # license: Public Domain
+    # source: https://gist.github.com/gdraheim/f2c89143040d4a2b2ed7147a176f14d0
+
+    def I1(value):
+        return struct.pack("!B", value & (2**8-1))
+    def I4(value):
+        return struct.pack("!I", value & (2**32-1))
+    # compute width&height from data if not explicit
+    if height is None:
+        height = len(data) # rows
+    if width is None:
+        width = 0
+        for row in data:
+            if width < len(row):
+                width = len(row)
+    # generate these chunks depending on image type
+    makeIHDR = True
+    makeIDAT = True
+    makeIEND = True
+    png = b"\x89" + "PNG\r\n\x1A\n".encode('ascii')
+    if makeIHDR:
+        colortype = 0 # true gray image (no palette)
+        bitdepth = 8 # with one byte per pixel (0..255)
+        compression = 0 # zlib (no choice here)
+        filtertype = 0 # adaptive (each scanline seperately)
+        interlaced = 0 # no
+        IHDR = I4(width) + I4(height) + I1(bitdepth)
+        IHDR += I1(colortype) + I1(compression)
+        IHDR += I1(filtertype) + I1(interlaced)
+        block = "IHDR".encode('ascii') + IHDR
+        png += I4(len(IHDR)) + block + I4(zlib.crc32(block))
+    if makeIDAT:
+        raw = b""
+        for y in range(height):
+            raw += b"\0" # no filter for this scanline
+            for x in range(width):
+                c = b"\0" # default black pixel
+                if y < len(data) and x < len(data[y]):
+                    c = I1(data[y][x])
+                raw += c
+        compressor = zlib.compressobj()
+        compressed = compressor.compress(raw)
+        compressed += compressor.flush() #!!
+        block = "IDAT".encode('ascii') + compressed
+        png += I4(len(compressed)) + block + I4(zlib.crc32(block))
+    if makeIEND:
+        block = "IEND".encode('ascii')
+        png += I4(0) + block + I4(zlib.crc32(block))
+    return png
+
+if __name__ == '__main__':
+    main(Path('nutils-potential.svg'))
